@@ -1,0 +1,293 @@
+"""
+Flask authentication system with:
+- Secure registration & login (password hashing via Werkzeug)
+- Session management with Flask-Login (HTTPOnly, SameSite, Secure cookies)
+- Protected routes (@login_required)
+- Role-Based Access Control (admin-only route)
+- Simple CSRF protection for state-changing endpoints when authenticated
+- SQLite via SQLAlchemy (single-file app)
+
+Run:
+  python app.py  # then visit http://127.0.0.1:5000
+
+API quickstart (JSON):
+  POST /register {"email":"a@b.com","password":"secret"}
+  POST /login    {"email":"a@b.com","password":"secret"}
+  GET  /protected  (requires login)
+  GET  /admin      (requires role == 'admin')
+  POST /logout     (requires login + CSRF header)
+
+Create an admin:
+  Set env ADMIN_EMAIL and ADMIN_PASSWORD on first run to auto-create an admin user.
+"""
+from __future__ import annotations
+import os
+import secrets
+from functools import wraps
+from typing import Optional
+
+from flask import Flask, jsonify, request, g
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import (
+    LoginManager, UserMixin, login_user, login_required,
+    current_user, logout_user
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# ----------------------------------------------------------------------------
+# App & Config
+# ----------------------------------------------------------------------------
+app = Flask(__name__)
+
+# A strong, secret key is required for sessions; use env var in production
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
+# SQLite in current directory
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL", "sqlite:///auth_demo.sqlite3"
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Session cookie hardening
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",  # consider "Strict" for same-site apps
+    SESSION_COOKIE_SECURE=bool(os.environ.get("COOKIE_SECURE", "0") == "1"),
+)
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = "login"  # not used for API, but good default
+
+# ----------------------------------------------------------------------------
+# Models
+# ----------------------------------------------------------------------------
+class User(UserMixin, db.Model):
+    __tablename__ = "users"
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(32), nullable=False, default="user")  # 'user' | 'admin'
+    # CSRF token tied to session (rotated on login/logout)
+    csrf_token = db.Column(db.String(64), nullable=True)
+
+    def set_password(self, password: str) -> None:
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password: str) -> bool:
+        return check_password_hash(self.password_hash, password)
+
+    def get_id(self) -> str:
+        # Flask-Login uses this to store the user id in session
+        return str(self.id)
+
+    def rotate_csrf(self) -> str:
+        self.csrf_token = secrets.token_hex(32)
+        return self.csrf_token
+
+# ----------------------------------------------------------------------------
+# DB initialization & optional admin bootstrap
+# ----------------------------------------------------------------------------
+@app.before_first_request
+def init_db():
+    db.create_all()
+    admin_email = os.environ.get("ADMIN_EMAIL")
+    admin_password = os.environ.get("ADMIN_PASSWORD")
+    if admin_email and admin_password:
+        existing = User.query.filter_by(email=admin_email).first()
+        if not existing:
+            admin = User(email=admin_email, role="admin")
+            admin.set_password(admin_password)
+            db.session.add(admin)
+            db.session.commit()
+
+# ----------------------------------------------------------------------------
+# Login manager hooks
+# ----------------------------------------------------------------------------
+@login_manager.user_loader
+def load_user(user_id: str) -> Optional[User]:
+    try:
+        return User.query.get(int(user_id))
+    except Exception:
+        return None
+
+# ----------------------------------------------------------------------------
+# Helpers: JSON responses & RBAC & CSRF
+# ----------------------------------------------------------------------------
+
+def json_error(message: str, code: int = 400):
+    return jsonify({"ok": False, "error": message}), code
+
+
+def require_role(*roles):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not current_user.is_authenticated:
+                return json_error("Authentication required", 401)
+            if current_user.role not in roles:
+                return json_error("Forbidden: insufficient role", 403)
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def csrf_protect(fn):
+    """Simple CSRF check for authenticated, state-changing requests.
+    Expect header: X-CSRF-Token == current_user.csrf_token
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if current_user.is_authenticated:
+            token = request.headers.get("X-CSRF-Token", "")
+            if not token or token != current_user.csrf_token:
+                return json_error("CSRF token missing/invalid", 403)
+        return fn(*args, **kwargs)
+    return wrapper
+
+# ----------------------------------------------------------------------------
+# Routes
+# ----------------------------------------------------------------------------
+@app.route("/")
+def index():
+    return jsonify({
+        "ok": True,
+        "message": "Auth API running",
+        "endpoints": {
+            "POST /register": {"email": "str", "password": "str", "role": "optional: user|admin"},
+            "POST /login": {"email": "str", "password": "str"},
+            "POST /logout": {"headers": {"X-CSRF-Token": "required when logged in"}},
+            "GET /me": "current user info",
+            "GET /protected": "requires login",
+            "GET /admin": "requires admin role",
+        }
+    })
+
+
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    role = (data.get("role") or "user").strip().lower()
+
+    if not email or not password:
+        return json_error("Email and password are required", 400)
+    if role not in {"user", "admin"}:
+        return json_error("Invalid role; use 'user' or 'admin'", 400)
+    if len(password) < 8:
+        return json_error("Password must be at least 8 characters", 400)
+
+    if User.query.filter_by(email=email).first():
+        return json_error("Email already registered", 409)
+
+    user = User(email=email, role=role)
+    user.set_password(password)
+    user.rotate_csrf()
+    db.session.add(user)
+    db.session.commit()
+
+    # Optionally log in immediately after registration
+    login_user(user)
+
+    return jsonify({
+        "ok": True,
+        "message": "Registered and logged in",
+        "csrf_token": user.csrf_token,
+        "user": {"id": user.id, "email": user.email, "role": user.role}
+    }), 201
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not user.check_password(password):
+        return json_error("Invalid email or password", 401)
+
+    # Rotate CSRF per login session
+    user.rotate_csrf()
+    db.session.commit()
+    login_user(user)
+
+    return jsonify({
+        "ok": True,
+        "message": "Logged in",
+        "csrf_token": user.csrf_token,
+        "user": {"id": user.id, "email": user.email, "role": user.role}
+    })
+
+
+@app.route("/logout", methods=["POST"])  # state-changing -> CSRF-protected
+@login_required
+@csrf_protect
+def logout():
+    # Rotate CSRF on logout to invalidate token
+    current_user.rotate_csrf()
+    db.session.commit()
+    logout_user()
+    return jsonify({"ok": True, "message": "Logged out"})
+
+
+@app.route("/me", methods=["GET"])  # safe (no CSRF needed)
+@login_required
+def me():
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "role": current_user.role,
+        }
+    })
+
+
+@app.route("/protected", methods=["GET"])  # safe (no CSRF)
+@login_required
+def protected():
+    return jsonify({"ok": True, "message": "You are authenticated!"})
+
+
+@app.route("/admin", methods=["GET"])  # safe (no CSRF)
+@require_role("admin")
+def admin_only():
+    return jsonify({"ok": True, "message": "Welcome, admin."})
+
+
+# ----------------------------------------------------------------------------
+# Error handlers (return JSON consistently)
+# ----------------------------------------------------------------------------
+@app.errorhandler(401)
+def _401(e):
+    return json_error("Authentication required", 401)
+
+
+@app.errorhandler(403)
+def _403(e):
+    return json_error("Forbidden", 403)
+
+
+@app.errorhandler(404)
+def _404(e):
+    return json_error("Not found", 404)
+
+
+@app.errorhandler(405)
+def _405(e):
+    return json_error("Method not allowed", 405)
+
+
+@app.errorhandler(429)
+def _429(e):
+    return json_error("Too many requests", 429)
+
+
+# ----------------------------------------------------------------------------
+# Dev server
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="127.0.0.1", port=port, debug=True)
